@@ -1,0 +1,23 @@
+# Generated database
+*.db
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+.env
+
+# Data files (uncomment if you want to ignore data directory)
+# data/
+# raw/
+
+# OS
+.DS_Store
+Thumbs.db
+.cache/
+
+# Working copies of SSO pages (legislation text, Government copyright) — kept
+# locally for the offline tests, never published. See tests/conftest.py.
+raw_fixtures/
+tests/fixtures/

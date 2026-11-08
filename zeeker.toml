@@ -1,0 +1,100 @@
+[project]
+name = "statutes"
+database = "statutes.db"
+title = "Singapore Statutes"
+description = "Singapore legislation from Singapore Statutes Online: current Acts with per-provision full text, version timeline metadata, and the as-published gazette stream. The legislation reproduced in this database is subject to the copyright of the Singapore Government and is reproduced with the permission of the Attorney-General's Chambers under the SSO Terms of Use (https://sso.agc.gov.sg/Terms-of-Use). Users should check Singapore Statutes Online (https://sso.agc.gov.sg) for the latest version of the legislation. This project is not affiliated with, nor endorsed by, AGC or SSO."
+license = "© Singapore Government. Reproduced with the permission of the Attorney-General's Chambers under the SSO Terms of Use."
+license_url = "https://sso.agc.gov.sg/Terms-of-Use"
+source = "Singapore Statutes Online (https://sso.agc.gov.sg)"
+
+# Resource order IS execution order (PRD "Rolling update architecture"):
+# gazette_stream first (stream ingestion + principal invalidation), then acts
+# (catalog reconciliation + queue drain, so tonight's invalidations re-extract
+# the SAME night), then act_versions (reads the extraction cache acts writes).
+
+[resource.gazette_stream]
+description = "Append-only event log of legislation as published: SL Supplement and Acts Supplement items with gazette numbers, publication dates, and parsed amendment/revocation events. Powers rolling updates."
+facets = ["series", "year", "event_kind", "principal_resolved"]
+sort = "published_date desc"
+fts_fields = ["title"]
+
+[resource.gazette_stream.columns]
+id = "Opaque SHA-256 hash of '{series}:{year}:{number_seq}' (first 12 hex chars) — the gazette number is the published identity of the item."
+series = "Supplement series: sl_supp or acts_supp (bills_supp reserved for later)."
+number = "Gazette/Act number exactly as published, e.g. 'S 355/2026' or '19 of 2025'. Content field, never a key."
+number_seq = "Integer part of the number. With year, the monotonic high-water-mark cursor for incremental ingestion. Unique-indexed with series and year as a key-drift tripwire."
+year = "Publication year (integer)."
+title = "Title of the instrument as published."
+published_date = "ISO publication date, taken from the /Published/{date} URL segment."
+source_url = "Absolute URL of the as-published item on SSO."
+pdf_url = "Absolute URL of the as-published PDF, with the '_' cache-buster stripped. As-published documents are immutable once gazetted."
+event_kind = "Parsed from the title: new, amendment, revocation, commencement, corrigenda, or other."
+principal_title = "Parsed name of the principal work for amendment/revocation events. NULL when not applicable or not parseable."
+principal_id = "Resolved reference to the principal work in the acts catalog (later also sl). NULL until resolved."
+principal_resolved = "True once the event is linked to a catalog work. False rows are picked up by the catalog-reconciliation safety net."
+created_at = "ISO 8601 timestamp when the stream row was ingested."
+
+[resource.acts]
+description = "Singapore Acts in force — consolidated current text with per-provision fragments and version timeline metadata, from Singapore Statutes Online."
+facets = ["year", "subtype", "has_content"]
+sort = "title asc"
+size = 25
+fragments = true
+fts_fields = ["title", "long_title"]
+fragments_fts_fields = ["content_text", "heading"]
+
+[resource.acts.columns]
+id = "Opaque SHA-256 hash of 'act:{shorthand}' (first 12 hex chars). Stable work-level identifier; survives any AGC URL reshuffling. All foreign keys point here."
+shorthand = "SSO work shorthand, e.g. IA1965, ACRAA2022. Natural/citation identifier — content field for humans and search, never used as a key. Unique-indexed as a key-drift tripwire."
+title = "Act title as listed, e.g. 'Interpretation Act 1965'."
+year = "Year of the Act (integer), parsed from the shorthand/title."
+status = "Lifecycle status. 'current' for listed Acts; 'delisted' flags works that vanished from the browse listing (repeal candidates — flagged, never deleted). Future-proofs repealed/spent and uncommenced Acts (deferred Phase 5)."
+subtype = "Listing quick-link facet: constitutional, private, imperial, or english_commercial. NULL when not derivable from the listing."
+current_as_at = "ISO date from the detail page's 'Current version as at {date}' status banner. Surfaces how fresh the consolidated text is (ToU cl 13(b) accuracy mitigation)."
+listing_stamp = "The '_' cache-buster value from the listing's PDF link (YYYYMMDDHHMMSS-style). Change-detection key: a changed stamp re-queues the Act for extraction."
+source_url = "Absolute URL of the Act's detail page on SSO (/Act/{shorthand}). Every row links back to its source."
+pdf_url = "Absolute URL of the current PDF, with the '_' cache-buster stripped."
+rss_url = "Per-Act amendments RSS feed (/Act/{shorthand}?ViewType=Rss) — the authoritative change signal."
+has_sl = "True if the listing shows a 'Subsidiary Legislation' action for this Act."
+long_title = "Long title from the detail page front matter."
+content_text = "Full consolidated body text of the current expression. NULL means 'not yet extracted'; empty string means 'extraction ran, no body'. Per-provision text lives in acts_fragments."
+has_content = "True if extraction produced a non-empty body. Distinguishes 'extraction succeeded' from 'not yet extracted' (content_text IS NULL)."
+fragment_count = "Number of rows in acts_fragments for this Act."
+extracted_at = "ISO 8601 timestamp of the last full-text extraction for this row."
+created_at = "ISO 8601 timestamp when the catalog row was first imported."
+
+[resource.acts_fragments]
+description = "One row per provision (section) of each Act's current expression — the unit lawyers cite and search. Subsection/paragraph structure is preserved verbatim in content_text and as offsets in structure_json; oversize sections split structurally into breadcrumbed child fragments."
+facets = ["unit_kind"]
+sort = "seq"
+
+[resource.acts_fragments.columns]
+id = "Opaque SHA-256 hash of '{parent_id}:{provision_id}' (first 12 hex chars). Cross-run stability not required: re-extraction replaces a work's fragments wholesale."
+parent_id = "Reference to acts.id (semantic FK; sqlite does not enforce it)."
+provision_id = "AKN-eId-flavoured, human-readable provision identifier, e.g. IA1965/longtitle, IA1965/s1, IA1965/pt2/s9A, EA1893/sch1; oversize-split children get a /c{n} suffix (IA1965/pt1/s2/c1). Deterministic from document structure; content field, never a key."
+provision_num = "Provision number as printed, e.g. '9A'. NULL for non-numbered units (long title, schedules)."
+unit_kind = "Fragment unit type: longtitle, section, or schedule. (Definitions and schedule paragraphs live inside their section/schedule fragment, typed in structure_json; per-term and per-paragraph units are deferred refinements.)"
+heading = "Provision heading, e.g. 'Definitions'. For schedules, the schedule heading ('FIRST SCHEDULE')."
+part_num = "Number of the enclosing Part, e.g. '2'. NULL when the Act has no Parts or the unit sits outside one."
+part_heading = "Heading of the enclosing Part, e.g. 'GENERAL PROVISIONS REGARDING WRITTEN LAW'. NULL as for part_num."
+seq = "0-based document-order position within the Act. Sorting by seq reconstitutes reading order."
+content_text = "Flattened provision text with every structural label — (1), (a), (i) — kept verbatim and newlines at structural boundaries, so pinpoint cites are FTS-findable and the text re-splits deterministically. Amendment-history notes are excluded (see source_notes)."
+structure_json = "JSON array of parsed structure nodes for this fragment: {num, kind: subsection|definition|paragraph|subparagraph, char_start, char_end, children: [...]} with character offsets into content_text (offsets slice the text back into exact subunit texts). NULL when the fragment has no sub-structure. Future-proofs pinpoint anchors and subclause-level diffing."
+source_notes = "Amendment-history annotations from the source text (e.g. '[Act 19 of 2025 wef 05/12/2025]'), captured here rather than polluting content_text/FTS. NULL when none."
+
+[resource.act_versions]
+description = "Version timeline metadata for each Act: every point-in-time expression with validity date, amending Act, and historical URLs. No historical text in this release."
+facets = ["valid_date"]
+sort = "valid_date desc"
+
+[resource.act_versions.columns]
+id = "Opaque SHA-256 hash of '{act_id}:{valid_date}' (first 12 hex chars) — one expression per work per validity date."
+act_id = "Reference to acts.id (semantic FK). Unique-indexed with valid_date as a key-drift tripwire."
+shorthand = "Parent Act's SSO shorthand, denormalised for readability, e.g. IA1965."
+valid_date = "ISO date this expression became the in-force text."
+doc_date = "ISO document date from the historical URL's DocDate parameter. NULL for the current expression (its timeline link carries no DocDate)."
+amended_by = "Amending instrument citation, e.g. 'Act 19 of 2025', or a revised-edition marker like '2020 RevEd'."
+historical_url = "Absolute URL of the point-in-time version page (/Act/{shorthand}/Historical/{valid_date}?...). NULL for the current expression, whose page is the Act's own source_url."
+pdf_url = "Absolute URL of the version-specific PDF, with the '_' cache-buster stripped. NULL when the timeline row carries no PDF link."
+is_current = "True for the row matching the Act's current expression."
+created_at = "ISO 8601 timestamp when this timeline row was first ingested. Table is append-mostly: new versions are appended as detected."
